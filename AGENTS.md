@@ -1,6 +1,6 @@
 # Repository Guidelines
 
-- Repo: https://github.com/openclaw/openclaw
+- Repo: https://github.com/zmeyer44/openclaw (fork of https://github.com/openclaw/openclaw)
 - GitHub issues/comments/PR comments: use literal multiline strings or `-F - <<'EOF'` (or $'...') for real newlines; never embed "\\n".
 
 ## Project Structure & Module Organization
@@ -109,9 +109,39 @@
 - When merging a PR from a new contributor: add their avatar to the README “Thanks to all clawtributors” thumbnail list.
 - After merging a PR: run `bun scripts/update-clawtributors.ts` if the contributor is missing, then commit the regenerated README.
 
+## Fork Sync (Upstream)
+
+This is a fork of https://github.com/openclaw/openclaw. Custom changes live on the `my-customizations` branch; `main` stays in sync with upstream.
+
+**Remotes:**
+- `origin` → this fork (zmeyer44/openclaw)
+- `upstream` → main repo (openclaw/openclaw)
+
+**Syncing workflow:**
+```bash
+# Fetch upstream changes
+git fetch upstream
+
+# Update main to match upstream
+git checkout main
+git merge upstream/main --ff-only
+git push origin main
+
+# Rebase customizations onto updated main
+git checkout my-customizations
+git rebase main
+git push origin my-customizations --force-with-lease
+```
+
+**Tips:**
+- Keep customizations minimal and isolated to reduce conflicts.
+- Tag stable points before rebasing: `git tag backup-before-rebase`
+- If rebase conflicts: resolve, `git add`, `git rebase --continue`. Or `git rebase --abort` to bail.
+
 ## Shorthand Commands
 
 - `sync`: if working tree is dirty, commit all changes (pick a sensible Conventional Commit message), then `git pull --rebase`; if rebase conflicts and cannot resolve, stop; otherwise `git push`.
+- `sync-upstream`: sync fork with upstream. Fetch upstream, fast-forward `main` to `upstream/main`, push to origin, then rebase `my-customizations` onto main and force-push. Return to original branch when done.
 
 ### PR Workflow (Review vs Land)
 
