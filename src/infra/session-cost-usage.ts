@@ -5,6 +5,7 @@ import type { NormalizedUsage, UsageLike } from "../agents/usage.js";
 import type { OpenClawConfig } from "../config/config.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import { normalizeUsage } from "../agents/usage.js";
+import { resolveStateDir } from "../config/paths.js";
 import {
   resolveSessionFilePath,
   resolveSessionTranscriptsDirForAgent,
@@ -63,11 +64,28 @@ export type CostUsageDailyEntry = CostUsageTotals & {
   date: string;
 };
 
+export type ModelBreakdownEntry = CostUsageTotals & {
+  provider: string;
+  model: string;
+  requests: number;
+};
+
+export type UserBreakdownEntry = CostUsageTotals & {
+  userId: string;
+  agentId: string;
+  label?: string;
+  channel?: string;
+  requests: number;
+  sessions: number;
+};
+
 export type CostUsageSummary = {
   updatedAt: number;
   days: number;
   daily: CostUsageDailyEntry[];
   totals: CostUsageTotals;
+  breakdown: ModelBreakdownEntry[];
+  userBreakdown: UserBreakdownEntry[];
 };
 
 export type SessionDailyUsage = {
@@ -367,12 +385,46 @@ async function scanUsageFile(params: {
   });
 }
 
+const makeModelKey = (provider?: string, model?: string): string => {
+  if (provider && model) {
+    return `${provider}::${model}`;
+  }
+  return model || provider || "unknown";
+};
+
+const emptyModelEntry = (provider: string, model: string): ModelBreakdownEntry => ({
+  provider,
+  model,
+  requests: 0,
+  ...emptyTotals(),
+});
+
+const emptyUserEntry = (agentId: string): UserBreakdownEntry => ({
+  userId: agentId,
+  agentId,
+  requests: 0,
+  sessions: 0,
+  ...emptyTotals(),
+});
+
+async function listAllAgentIds(): Promise<string[]> {
+  const stateDir = resolveStateDir();
+  const agentsDir = path.join(stateDir, "agents");
+  try {
+    const entries = await fs.promises.readdir(agentsDir, { withFileTypes: true });
+    return entries.filter((e) => e.isDirectory()).map((e) => e.name);
+  } catch {
+    return ["main"];
+  }
+}
+
 export async function loadCostUsageSummary(params?: {
   startMs?: number;
   endMs?: number;
   days?: number; // Deprecated, for backwards compatibility
   config?: OpenClawConfig;
   agentId?: string;
+  allAgents?: boolean;
 }): Promise<CostUsageSummary> {
   const now = new Date();
   let sinceTime: number;
@@ -391,56 +443,105 @@ export async function loadCostUsageSummary(params?: {
   }
 
   const dailyMap = new Map<string, CostUsageTotals>();
+  const modelMap = new Map<string, ModelBreakdownEntry>();
+  const userMap = new Map<string, UserBreakdownEntry>();
   const totals = emptyTotals();
 
-  const sessionsDir = resolveSessionTranscriptsDirForAgent(params?.agentId);
-  const entries = await fs.promises.readdir(sessionsDir, { withFileTypes: true }).catch(() => []);
-  const files = (
-    await Promise.all(
-      entries
-        .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
-        .map(async (entry) => {
-          const filePath = path.join(sessionsDir, entry.name);
-          const stats = await fs.promises.stat(filePath).catch(() => null);
-          if (!stats) {
-            return null;
-          }
-          // Include file if it was modified after our start time
-          if (stats.mtimeMs < sinceTime) {
-            return null;
-          }
-          return filePath;
-        }),
-    )
-  ).filter((filePath): filePath is string => Boolean(filePath));
+  // Determine which agents to scan
+  const agentIds = params?.allAgents ? await listAllAgentIds() : [params?.agentId ?? "main"];
 
-  for (const filePath of files) {
-    await scanUsageFile({
-      filePath,
-      config: params?.config,
-      onEntry: (entry) => {
-        const ts = entry.timestamp?.getTime();
-        if (!ts || ts < sinceTime || ts > untilTime) {
-          return;
-        }
-        const dayKey = formatDayKey(entry.timestamp ?? now);
-        const bucket = dailyMap.get(dayKey) ?? emptyTotals();
-        applyUsageTotals(bucket, entry.usage);
-        if (entry.costBreakdown?.total !== undefined) {
-          applyCostBreakdown(bucket, entry.costBreakdown);
-        } else {
-          applyCostTotal(bucket, entry.costTotal);
-        }
-        dailyMap.set(dayKey, bucket);
+  for (const agentId of agentIds) {
+    const sessionsDir = resolveSessionTranscriptsDirForAgent(agentId);
+    const entries = await fs.promises.readdir(sessionsDir, { withFileTypes: true }).catch(() => []);
+    const files = (
+      await Promise.all(
+        entries
+          .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+          .map(async (entry) => {
+            const filePath = path.join(sessionsDir, entry.name);
+            const stats = await fs.promises.stat(filePath).catch(() => null);
+            if (!stats) {
+              return null;
+            }
+            // Include file if it was modified after our start time
+            if (stats.mtimeMs < sinceTime) {
+              return null;
+            }
+            return { filePath, sessionId: entry.name.replace(/\.jsonl$/, "") };
+          }),
+      )
+    ).filter((item): item is { filePath: string; sessionId: string } => Boolean(item));
 
-        applyUsageTotals(totals, entry.usage);
-        if (entry.costBreakdown?.total !== undefined) {
-          applyCostBreakdown(totals, entry.costBreakdown);
-        } else {
-          applyCostTotal(totals, entry.costTotal);
-        }
-      },
-    });
+    // Track sessions per agent for userBreakdown
+    const agentSessionIds = new Set<string>();
+
+    for (const { filePath, sessionId } of files) {
+      let sessionHasEntries = false;
+
+      await scanUsageFile({
+        filePath,
+        config: params?.config,
+        onEntry: (entry) => {
+          const ts = entry.timestamp?.getTime();
+          if (!ts || ts < sinceTime || ts > untilTime) {
+            return;
+          }
+
+          if (!sessionHasEntries) {
+            sessionHasEntries = true;
+            agentSessionIds.add(sessionId);
+          }
+
+          const dayKey = formatDayKey(entry.timestamp ?? now);
+          const bucket = dailyMap.get(dayKey) ?? emptyTotals();
+          applyUsageTotals(bucket, entry.usage);
+          if (entry.costBreakdown?.total !== undefined) {
+            applyCostBreakdown(bucket, entry.costBreakdown);
+          } else {
+            applyCostTotal(bucket, entry.costTotal);
+          }
+          dailyMap.set(dayKey, bucket);
+
+          applyUsageTotals(totals, entry.usage);
+          if (entry.costBreakdown?.total !== undefined) {
+            applyCostBreakdown(totals, entry.costBreakdown);
+          } else {
+            applyCostTotal(totals, entry.costTotal);
+          }
+
+          // Track per-model breakdown
+          const modelKey = makeModelKey(entry.provider, entry.model);
+          const modelEntry =
+            modelMap.get(modelKey) ??
+            emptyModelEntry(entry.provider ?? "", entry.model ?? "unknown");
+          applyUsageTotals(modelEntry, entry.usage);
+          if (entry.costBreakdown?.total !== undefined) {
+            applyCostBreakdown(modelEntry, entry.costBreakdown);
+          } else {
+            applyCostTotal(modelEntry, entry.costTotal);
+          }
+          modelEntry.requests += 1;
+          modelMap.set(modelKey, modelEntry);
+
+          // Track per-agent (user) breakdown
+          const userEntry = userMap.get(agentId) ?? emptyUserEntry(agentId);
+          applyUsageTotals(userEntry, entry.usage);
+          if (entry.costBreakdown?.total !== undefined) {
+            applyCostBreakdown(userEntry, entry.costBreakdown);
+          } else {
+            applyCostTotal(userEntry, entry.costTotal);
+          }
+          userEntry.requests += 1;
+          userMap.set(agentId, userEntry);
+        },
+      });
+    }
+
+    // Update session count for this agent
+    const userEntry = userMap.get(agentId);
+    if (userEntry) {
+      userEntry.sessions = agentSessionIds.size;
+    }
   }
 
   const daily = Array.from(dailyMap.entries())
@@ -450,11 +551,17 @@ export async function loadCostUsageSummary(params?: {
   // Calculate days for backwards compatibility in response
   const days = Math.ceil((untilTime - sinceTime) / (24 * 60 * 60 * 1000)) + 1;
 
+  const breakdown = Array.from(modelMap.values()).toSorted((a, b) => b.totalCost - a.totalCost);
+
+  const userBreakdown = Array.from(userMap.values()).toSorted((a, b) => b.totalCost - a.totalCost);
+
   return {
     updatedAt: Date.now(),
     days,
     daily,
     totals,
+    breakdown,
+    userBreakdown,
   };
 }
 

@@ -109,12 +109,23 @@ const parseDateRange = (params: {
   return { startMs: defaultStartMs, endMs: todayEndMs };
 };
 
+const parseAllAgents = (raw: unknown): boolean => {
+  if (typeof raw === "boolean") {
+    return raw;
+  }
+  if (raw === "true" || raw === "1") {
+    return true;
+  }
+  return false;
+};
+
 async function loadCostUsageSummaryCached(params: {
   startMs: number;
   endMs: number;
+  allAgents: boolean;
   config: ReturnType<typeof loadConfig>;
 }): Promise<CostUsageSummary> {
-  const cacheKey = `${params.startMs}-${params.endMs}`;
+  const cacheKey = `${params.startMs}-${params.endMs}:${params.allAgents ? "all" : "main"}`;
   const now = Date.now();
   const cached = costUsageCache.get(cacheKey);
   if (cached?.summary && cached.updatedAt && now - cached.updatedAt < COST_USAGE_CACHE_TTL_MS) {
@@ -133,6 +144,7 @@ async function loadCostUsageSummaryCached(params: {
     startMs: params.startMs,
     endMs: params.endMs,
     config: params.config,
+    allAgents: params.allAgents,
   })
     .then((summary) => {
       costUsageCache.set(cacheKey, { summary, updatedAt: Date.now() });
@@ -237,7 +249,8 @@ export const usageHandlers: GatewayRequestHandlers = {
       endDate: params?.endDate,
       days: params?.days,
     });
-    const summary = await loadCostUsageSummaryCached({ startMs, endMs, config });
+    const allAgents = parseAllAgents(params?.allAgents);
+    const summary = await loadCostUsageSummaryCached({ startMs, endMs, allAgents, config });
     respond(true, summary, undefined);
   },
   "sessions.usage": async ({ respond, params }) => {
